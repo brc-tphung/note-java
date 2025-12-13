@@ -1,0 +1,138 @@
+Để tạo một Custom Annotation dùng để lọc (filter) hoặc kiểm tra điều kiện trước khi một action trong Controller được thực thi, giải pháp mạnh mẽ và chuẩn nhất trong Spring Boot là sử dụng **AOP (Aspect Oriented Programming)**.
+
+Dưới đây là hướng dẫn từng bước để xây dựng tính năng này. Ví dụ này sẽ tạo một annotation tên là `@ApiSecretCheck` để kiểm tra xem request có chứa một Header bí mật hay không.
+
+### 1\. Tạo Annotation Interface
+
+Đầu tiên, bạn cần định nghĩa annotation. Chúng ta cần đánh dấu nó là khả dụng lúc chạy (`RUNTIME`) và áp dụng cho phương thức (`METHOD`).
+
+```java
+package com.example.demo.annotation;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Target(ElementType.METHOD) // Áp dụng cho Method
+@Retention(RetentionPolicy.RUNTIME) // Tồn tại lúc chạy runtime
+public @interface ApiSecretCheck {
+    // Bạn có thể thêm các thuộc tính nếu cần, ví dụ:
+    String value() default ""; 
+    boolean required() default true;
+}
+```
+
+### 2\. Tạo Aspect để xử lý Logic (The Filter Logic)
+
+Đây là nơi chứa code xử lý "lọc". Chúng ta sẽ dùng `@Around` để bao bọc method được gọi. Nếu điều kiện thỏa mãn, ta cho phép chạy (`joinPoint.proceed()`), nếu không ta ném lỗi.
+
+*Lưu ý: Bạn cần thêm dependency `spring-boot-starter-aop` trong `pom.xml` hoặc `build.gradle` nếu chưa có.*
+
+```java
+package com.example.demo.aspect;
+
+import com.example.demo.annotation.ApiSecretCheck;
+import jakarta.servlet.http.HttpServletRequest;
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.springframework.stereotype.Component;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
+@Aspect
+@Component
+public class ApiSecretCheckAspect {
+
+    @Around("@annotation(apiSecretCheck)") // Lắng nghe các hàm có gắn annotation này
+    public Object validateApiSecret(ProceedingJoinPoint joinPoint, ApiSecretCheck apiSecretCheck) throws Throwable {
+        
+        // 1. Lấy Request hiện tại
+        ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+        if (attributes == null) {
+            return joinPoint.proceed();
+        }
+        HttpServletRequest request = attributes.getRequest();
+
+        // 2. Thực hiện logic lọc (Ví dụ: Kiểm tra Header "X-Secret-Key")
+        String secretKey = request.getHeader("X-Secret-Key");
+
+        // Logic check: Nếu không có key hoặc key sai
+        if (secretKey == null || !secretKey.equals("MY-SUPER-SECRET-PASSWORD")) {
+            // Chặn action, ném ra ngoại lệ
+            throw new RuntimeException("Truy cập bị từ chối: Thiếu Secret Key hợp lệ!");
+        }
+
+        // 3. Nếu hợp lệ, cho phép Action trong Controller chạy tiếp
+        return joinPoint.proceed();
+    }
+}
+```
+
+### 3\. Áp dụng vào Controller
+
+Bây giờ bạn chỉ cần gắn annotation `@ApiSecretCheck` lên bất kỳ API nào bạn muốn bảo vệ/lọc.
+
+```java
+package com.example.demo.controller;
+
+import com.example.demo.annotation.ApiSecretCheck;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api")
+public class DemoController {
+
+    // API này ai cũng gọi được
+    @GetMapping("/public")
+    public String publicEndpoint() {
+        return "Đây là public endpoint.";
+    }
+
+    // API này sẽ bị chặn bởi Aspect nếu không có Header đúng
+    @ApiSecretCheck 
+    @GetMapping("/private")
+    public String privateEndpoint() {
+        return "Bạn đã vào được private endpoint!";
+    }
+}
+```
+
+### 4\. (Tùy chọn) Xử lý lỗi trả về đẹp hơn
+
+Thay vì để Spring ném ra lỗi 500 xấu xí khi `throw new RuntimeException`, bạn nên dùng `@ExceptionHandler` để trả về JSON chuẩn.
+
+```java
+package com.example.demo.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<String> handleRuntimeException(RuntimeException ex) {
+        // Trả về lỗi 403 Forbidden kèm message
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(ex.getMessage());
+    }
+}
+```
+
+-----
+
+### Tóm tắt luồng hoạt động
+
+1.  Client gọi `/api/private`.
+2.  Spring phát hiện method này có `@ApiSecretCheck`.
+3.  `ApiSecretCheckAspect` chặn lại trước.
+4.  Nó kiểm tra Header `X-Secret-Key`.
+5.  Nếu sai -\> Ném lỗi -\> Client nhận 403.
+6.  Nếu đúng -\> `joinPoint.proceed()` -\> Code trong Controller chạy -\> Client nhận 200 OK.
+
+**Bạn có muốn tôi hướng dẫn cách truyền tham số động vào Annotation (ví dụ: kiểm tra quyền `ADMIN` hay `USER` cụ thể) không?**
