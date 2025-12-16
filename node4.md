@@ -1,141 +1,98 @@
-Chào bạn, tôi đã hiểu yêu cầu thay đổi.
+Đây là một câu hỏi rất thực tế! Trong một dự án, không phải bảng nào cũng có cờ xóa mềm (Soft Delete). Ví dụ bảng `User` có, nhưng bảng `Config` hoặc `Category` có thể không.
 
-Việc không sử dụng Exception để điều hướng luồng (flow control) là một tư duy tốt để tối ưu hiệu năng (vì tạo Exception tốn chi phí hệ thống).
+Nếu ta cứ cố tình `Query ... AND e.deleteFlag = 0` với bảng không có trường này, Hibernate sẽ báo lỗi ngay lập tức.
 
-Để làm được việc này:
+Giải pháp chuẩn cho **Dev Level 1** là sử dụng **Reflection** để kiểm tra sự tồn tại của trường `deleteFlag` trước khi tạo câu Query.
 
-1. Chúng ta sẽ chuyển từ `@Before` sang **`@Around`**.
-2. `@Around` cho phép ta quyết định: có chạy hàm Controller tiếp không (`proceed`), hay cắt ngang và trả về kết quả (JSON lỗi) ngay lập tức.
+Dưới đây là cách sửa lại hàm `checkDataExistence` trong `AccessAspect`:
 
-Dưới đây là giải pháp hoàn chỉnh cho Task này:
+###Giải pháp: Kiểm tra field động (Dynamic Field Check)Logic xử lý sẽ là:
 
-###1. Giữ nguyên Annotation```java
-@Target(ElementType.METHOD)
-@Retention(RetentionPolicy.RUNTIME)
-public @interface CheckAccess {
-    Class<?>[] tables();
-}
+1. Tạo câu HQL cơ bản: `SELECT count(e) FROM Entity e WHERE e.id = :id`.
+2. Dùng Java Reflection kiểm tra: "Class này có trường tên là `deleteFlag` không?".
+3. Nếu **CÓ**: Nối thêm chuỗi ` AND e.deleteFlag = 0`.
+4. Nếu **KHÔNG**: Giữ nguyên câu query (chỉ check ID).
 
-```
-
-###2. Sửa lại Aspect (`@Around` thay vì `@Before`)Logic bây giờ là:
-
-* Nếu lỗi -> `return ResponseEntity` chứa JSON lỗi ngay lập tức.
-* Nếu OK -> gọi `joinPoint.proceed()` để code chạy tiếp vào Controller.
+###Code cập nhật (`AccessAspect.java`)Bạn chỉ cần thay thế hàm `checkDataExistence` cũ bằng hàm dưới đây:
 
 ```java
-import org.aspectj.lang.ProceedingJoinPoint;
-import org.aspectj.lang.annotation.Around;
-import org.aspectj.lang.annotation.Aspect;
-import org.aspectj.lang.reflect.MethodSignature;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.stereotype.Component;
+    // ... các import cần thiết
+    import java.lang.reflect.Field;
 
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.Query;
-import java.util.HashMap;
-import java.util.Map;
-
-@Aspect
-@Component
-public class AccessAspect {
-
-    @Autowired
-    private EntityManager entityManager;
-
-    // Dùng @Around để có thể trả về giá trị thay thế (JSON lỗi) thay vì throw Exception
-    @Around("@annotation(checkAccess)")
-    public Object validateAccess(ProceedingJoinPoint joinPoint, CheckAccess checkAccess) throws Throwable {
-        
-        // 1. Lấy ID
-        Object id = getIdFromArgs(joinPoint);
-        if (id == null) {
-            return buildErrorResponse(-1L, "ID không tồn tại trong request");
-        }
-
-        Class<?>[] tables = checkAccess.tables();
-
-        // 2. Duyệt qua từng bảng
-        for (Class<?> tableClass : tables) {
-            String tableName = tableClass.getSimpleName();
-
-            // A. Check Quyền (Logic giả định)
-            boolean hasPermission = checkPermissionInSetting(tableName);
-            if (!hasPermission) {
-                // Return ngay lập tức, không chạy controller nữa
-                return buildErrorResponse(1L, "Bạn bị chặn quyền truy cập bảng: " + tableName);
-            }
-
-            // B. Check Tồn tại & Delete Flag
-            boolean isDataValid = checkDataExistence(tableClass, id);
-            
-            // --- TRẢ VỀ JSON TRỰC TIẾP, KHÔNG THROW EXCEPTION ---
-            if (!isDataValid) {
-                // Trả về code 2L như bạn yêu cầu
-                return buildErrorResponse(2L, "Dữ liệu không tồn tại hoặc đã bị xóa ở bảng: " + tableName);
-            }
-        }
-
-        // 3. Nếu tất cả đều qua -> Cho phép chạy tiếp vào Controller
-        return joinPoint.proceed();
-    }
-
-    // --- CÁC HÀM HỖ TRỢ (HELPER) ---
-
-    // Hàm build JSON response nhanh
-    private ResponseEntity<Map<String, Object>> buildErrorResponse(Long code, String mess) {
-        Map<String, Object> response = new HashMap<>();
-        response.put("code", code);
-        response.put("mess", mess);
-        // Trả về HTTP 200 OK để Client đọc được JSON
-        return ResponseEntity.ok(response);
-    }
-
-    private Object getIdFromArgs(ProceedingJoinPoint joinPoint) {
-        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        String[] paramNames = signature.getParameterNames();
-        Object[] args = joinPoint.getArgs();
-        for (int i = 0; i < paramNames.length; i++) {
-            if ("id".equals(paramNames[i])) return args[i];
-        }
-        return null;
-    }
+    // ...
 
     private boolean checkDataExistence(Class<?> entityClass, Object id) {
         try {
-            // Giả sử bảng nào cũng có trường deleteFlag
-            String hql = "SELECT count(e) FROM " + entityClass.getName() + " e WHERE e.id = :id AND e.deleteFlag = 0";
-            Query query = entityManager.createQuery(hql);
+            // 1. Khởi tạo câu query cơ bản (chỉ check ID)
+            StringBuilder hql = new StringBuilder();
+            hql.append("SELECT count(e) FROM ").append(entityClass.getName()).append(" e");
+            hql.append(" WHERE e.id = :id");
+
+            // 2. Kiểm tra xem Entity này có trường 'deleteFlag' không?
+            boolean hasDeleteFlag = hasField(entityClass, "deleteFlag");
+
+            // 3. Nếu có thì mới nối thêm điều kiện vào câu Query
+            if (hasDeleteFlag) {
+                hql.append(" AND e.deleteFlag = 0");
+            }
+
+            // 4. Thực thi Query
+            Query query = entityManager.createQuery(hql.toString());
             query.setParameter("id", id);
+            
             Long count = (Long) query.getSingleResult();
             return count > 0;
+
         } catch (Exception e) {
-            // Log lỗi nếu cần (ví dụ bảng không có trường deleteFlag)
+            e.printStackTrace(); // Log lỗi để debug nếu query sai cú pháp
             return false;
         }
     }
-    
-    private boolean checkPermissionInSetting(String tableName) {
-        // Logic check quyền setting của bạn ở đây
-        return true; 
+
+    // Hàm tiện ích để check field tồn tại (Sử dụng Reflection)
+    private boolean hasField(Class<?> clazz, String fieldName) {
+        try {
+            // getDeclaredField sẽ tìm field trong class đó
+            clazz.getDeclaredField(fieldName);
+            return true;
+        } catch (NoSuchFieldException e) {
+            // Nếu không tìm thấy -> Return false
+            return false;
+        }
     }
+
+```
+
+###Giải thích luồng chạy1. **Nếu bảng User (có deleteFlag):**
+* Hàm `hasField` trả về `true`.
+* Query thành: `... WHERE e.id = :id AND e.deleteFlag = 0`.
+* Kết quả: Check cả tồn tại + xóa mềm.
+
+
+2. **Nếu bảng Setting (không có deleteFlag):**
+* Hàm `hasField` trả về `false` (nhảy vào catch `NoSuchFieldException` nhưng ta nuốt lỗi và trả về false).
+* Query thành: `... WHERE e.id = :id`.
+* Kết quả: Chỉ check ID tồn tại là đủ.
+
+
+
+---
+
+###Mẹo nâng cao (Optional)Nếu trong dự án, tên trường xóa mềm không thống nhất (ví dụ bảng thì đặt là `deleteFlag`, bảng thì `isDeleted`, bảng thì `deleted`), bạn có thể nâng cấp hàm `hasField` để check một danh sách các tên phổ biến:
+
+```java
+// Ví dụ mở rộng
+private String getDeleteFieldIfExist(Class<?> clazz) {
+    String[] possibleNames = {"deleteFlag", "isDeleted", "deleted", "delFlag"};
+    for (String name : possibleNames) {
+        try {
+            clazz.getDeclaredField(name);
+            return name; // Trả về tên field tìm thấy đầu tiên
+        } catch (NoSuchFieldException ignored) { }
+    }
+    return null; // Không tìm thấy cái nào
 }
 
 ```
 
-###3. Kết quả testBây giờ bạn không cần `GlobalExceptionHandler` cho việc này nữa.
-
-* **Case 1 (Thành công):** Aspect chạy xong vòng lặp -> gọi `joinPoint.proceed()` -> Controller chạy -> Trả về `{code: 0, mess: "cho qua"}`.
-* **Case 2 (Lỗi Data/Quyền):** Aspect gặp lỗi -> gọi `buildErrorResponse(2L, ...)` -> Trả về JSON ngay lập tức:
-```json
-{
-    "code": 2,
-    "mess": "Dữ liệu không tồn tại hoặc đã bị xóa ở bảng: User"
-}
-
-```
-
-
-
-###Next StepBạn có muốn tôi tách các **Mã lỗi (Error Code)** (`-1L`, `1L`, `2L`) và **Message** ra một file `Const` hoặc `Enum` riêng để dễ quản lý, tránh việc fix cứng số (hardcode) trong code Java không? Điều này sẽ giúp code "xịn" hơn rất nhiều.
+###Next StepHiện tại việc dùng Reflection (`clazz.getDeclaredField`) mỗi lần request gọi tới sẽ hơi tốn tài nguyên một chút (dù rất nhỏ). Bạn có muốn tôi hướng dẫn cách **Cache** kết quả kiểm tra này (dùng `ConcurrentHashMap`) để code chạy nhanh tối đa (High Performance) không?
