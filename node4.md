@@ -215,6 +215,180 @@ public class DemoController {
 * Kiểm tra bảng phân quyền (Setting table).
 * Chạy câu Query dynamic vào DB bảng `User`: `SELECT count... WHERE id=1 AND deleteFlag=0`.
 
+Đã rõ, bạn muốn nhấn mạnh việc **Annotation nhận vào một mảng (danh sách) các bảng** và logic phải xử lý duyệt qua **từng bảng** trong danh sách đó để kiểm tra.
+
+Nếu user không có quyền ở bảng bất kỳ trong danh sách, hoặc ID không tồn tại/đã xóa ở bảng đó, thì đều chặn.
+
+Dưới đây là code đã tinh chỉnh để xử lý **mảng table**.
+
+###1. Annotation (`@CheckAccess`)Tôi đặt tên tham số là `tables` để bạn truyền vào danh sách dạng mảng `{TableA.class, TableB.class}`.
+
+```java
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface CheckAccess {
+    // Nhận vào một mảng các Class (đại diện cho các bảng)
+    Class<?>[] tables();
+}
+
+```
+
+---
+
+###2. Aspect Xử lý Logic (`AccessAspect`) - Core LogicĐây là phần quan trọng nhất. Tôi sẽ dùng vòng lặp `for` để duyệt qua danh sách bảng bạn truyền vào.
+
+Logic trong vòng lặp:
+
+1. Check **Setting Quyền** (User có được truy cập bảng này không?).
+2. Check **Data** (ID có tồn tại trong bảng này và `delete_flag == 0` không?).
+
+```java
+import org.aspectj.lang.JoinPoint;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.annotation.Before;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.Query;
+
+@Aspect
+@Component
+public class AccessAspect {
+
+    @Autowired
+    private EntityManager entityManager;
+
+    @Before("@annotation(checkAccess)")
+    public void validateAccess(JoinPoint joinPoint, CheckAccess checkAccess) {
+        
+        // 1. Lấy ID từ tham số request
+        Object id = getIdFromArgs(joinPoint);
+        if (id == null) {
+            throw new AccessDeniedException("ID không tồn tại trong request");
+        }
+
+        // 2. Lấy danh sách bảng từ Annotation
+        Class<?>[] tables = checkAccess.tables();
+
+        // 3. Duyệt qua từng bảng để kiểm tra
+        for (Class<?> tableClass : tables) {
+            String tableName = tableClass.getSimpleName(); // Lấy tên bảng (Entity)
+
+            // --- BƯỚC 3.1: CHECK QUYỀN TRONG BẢNG SETTING ---
+            // Giả sử bạn có hàm check quyền. Logic: User hiện tại + Tên bảng -> Có quyền không?
+            boolean hasPermission = checkPermissionInSetting(tableName); 
+            
+            if (!hasPermission) {
+                // Trả về lỗi nếu bị chặn quyền
+                throw new AccessDeniedException("Bạn không có quyền truy cập bảng: " + tableName);
+            }
+
+            // --- BƯỚC 3.2: CHECK TỒN TẠI VÀ DELETE_FLAG ---
+            boolean isDataValid = checkDataExistence(tableClass, id);
+            
+            if (!isDataValid) {
+                // Trả về lỗi nếu ID không có hoặc đã bị xoá
+                throw new AccessDeniedException("Dữ liệu không tồn tại hoặc đã bị xóa ở bảng: " + tableName);
+            }
+        }
+        
+        // Nếu chạy hết vòng for mà không Exception -> Controller sẽ trả về {code: 0, mess: "cho qua"}
+    }
+
+    // --- Các hàm phụ trợ ---
+
+    // Giả lập check bảng Setting quyền
+    private boolean checkPermissionInSetting(String tableName) {
+        // TODO: Query vào bảng 'permission_setting' của bạn
+        // Query: SELECT allow FROM permission_setting WHERE user_id = ? AND table_name = ?
+        // Ở đây tôi return true để demo luồng chạy
+        return true; 
+    }
+
+    // Query kiểm tra ID và Delete Flag
+    private boolean checkDataExistence(Class<?> entityClass, Object id) {
+        // Query: SELECT count FROM Table WHERE id = :id AND delete_flag = 0
+        try {
+            String hql = "SELECT count(e) FROM " + entityClass.getName() + " e WHERE e.id = :id AND e.deleteFlag = 0";
+            Query query = entityManager.createQuery(hql);
+            query.setParameter("id", id);
+            Long count = (Long) query.getSingleResult();
+            return count > 0;
+        } catch (Exception e) {
+            // Nếu bảng không có trường deleteFlag hoặc lỗi SQL -> coi như không hợp lệ
+            return false;
+        }
+    }
+
+    private Object getIdFromArgs(JoinPoint joinPoint) {
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        String[] paramNames = signature.getParameterNames();
+        Object[] args = joinPoint.getArgs();
+        for (int i = 0; i < paramNames.length; i++) {
+            if ("id".equals(paramNames[i])) return args[i];
+        }
+        return null;
+    }
+}
+
+```
+
+---
+
+###3. ControllerAdvice (Trả về JSON đúng chuẩn)Phần này giữ nguyên để đảm bảo output đúng yêu cầu của bạn.
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAccessDenied(AccessDeniedException ex) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("code", 1); // Code lỗi
+        response.put("mess", ex.getMessage()); // Message chi tiết lỗi
+        return new ResponseEntity<>(response, HttpStatus.OK); // Trả về 200 OK nhưng body báo lỗi (hoặc 403 tuỳ bạn)
+    }
+}
+
+```
+
+---
+
+###4. Cách sử dụng (Truyền danh sách mảng)Bây giờ tại Controller, bạn có thể truyền 1 hoặc nhiều bảng vào Annotation.
+
+Ví dụ: API xoá một User, logic yêu cầu User đó phải tồn tại trong bảng `User` và cả bảng `UserProfile` (ví dụ logic ràng buộc chặt).
+
+```java
+@RestController
+@RequestMapping("/api")
+public class UserController {
+
+    // TRUYỀN MẢNG TABLE VÀO ĐÂY
+    @CheckAccess(tables = {User.class, UserProfile.class}) 
+    @PostMapping("/users/delete/{id}")
+    public ResponseEntity<Map<String, Object>> deleteUser(@PathVariable Long id) {
+        
+        // Nếu code vào được đây nghĩa là:
+        // 1. User có quyền với cả bảng User và UserProfile.
+        // 2. ID này tồn tại và chưa bị xoá ở CẢ 2 bảng.
+        
+        Map<String, Object> response = new HashMap<>();
+        response.put("code", 0);
+        response.put("mess", "cho qua");
+        return ResponseEntity.ok(response);
+    }
+}
+
+```
+
+###Next StepBạn có muốn tôi viết chi tiết câu Query SQL trong hàm `checkPermissionInSetting` để map đúng với cấu trúc bảng phân quyền (ví dụ: bảng `role_permission`) trong database thực tế của bạn không?
+
 
 3. **Kịch bản 1 (Lỗi):** Nếu ID = 1 có `deleteFlag = 1` -> Ném `AccessDeniedException`. `GlobalExceptionHandler` bắt và trả về JSON: `{code: 1, mess: "Dữ liệu không tồn tại hoặc đã bị xoá..."}`.
 4. **Kịch bản 2 (Thành công):** Nếu mọi thứ OK -> Aspect cho phép chạy vào hàm `getUserDetail`. Hàm này trả về JSON: `{code: 0, mess: "cho qua"}`.
